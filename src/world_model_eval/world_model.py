@@ -42,28 +42,31 @@ class WorldModel:
         self.cfg = default_cfg  # Feel free to override this after __init__
 
     def reset(self, x):
-        x = einops.repeat(x, "h w c -> b t h w c", b=1, t=1)
+        x = einops.repeat(x, "b h w c -> b t h w c", t=1)
+        self.batch_size = x.shape[0]
         self.xs = self.vae.encode(x)
-        self.actions = torch.zeros((1, 1, self.model.action_dim), device=self.device)
+        self.actions = torch.zeros((self.batch_size, 1, self.model.action_dim), device=self.device)
         self.curr_frame = 1
 
     @torch.no_grad()
     def generate_chunk(self, action_vec):
         """See Diffusion.generate"""
+        if action_vec.dim() == 2:
+            # Batch of actions (batch_size, action_dim) -> (batch_size, 1, action_dim)
+            action_vec = action_vec.unsqueeze(1)
+        
         action_chunk = torch.zeros(
-            (1, self.chunk_size, self.model.action_dim), device=self.device
+            (self.batch_size, self.chunk_size, self.model.action_dim), device=self.device
         )
         assert self.actions.shape[1] == self.curr_frame
         self.actions = torch.cat([self.actions, action_chunk], dim=1)
-        self.actions[:, self.curr_frame : self.curr_frame + self.chunk_size, :] = (
-            action_vec
-        )
+        self.actions[:, self.curr_frame : self.curr_frame + self.chunk_size, :] = action_vec
 
         scheduling_matrix = self.diffusion.generate_pyramid_scheduling_matrix(
             self.chunk_size
         )
         chunk = torch.randn(
-            (1, self.chunk_size, *self.xs.shape[-3:]), device=self.device
+            (self.batch_size, self.chunk_size, *self.xs.shape[-3:]), device=self.device
         )
         self.xs = torch.cat([self.xs, chunk], dim=1)
 
@@ -73,14 +76,13 @@ class WorldModel:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             for m in range(scheduling_matrix.shape[0] - 1):
                 t, t_next = scheduling_matrix[m], scheduling_matrix[m + 1]
-                t, t_next = map(
-                    lambda x: einops.repeat(x, "t -> b t", b=1), (t, t_next)
+                t = einops.repeat(t, "t -> b t", b=self.batch_size)
+                t_next = einops.repeat(t_next, "t -> b t", b=self.batch_size)
+                t = torch.cat(
+                    (torch.zeros((self.batch_size, self.curr_frame), dtype=torch.long, device=t.device), t), dim=1
                 )
-                t, t_next = map(
-                    lambda x: torch.cat(
-                        (torch.zeros((1, self.curr_frame), dtype=torch.long), x), dim=1
-                    ),
-                    (t, t_next),
+                t_next = torch.cat(
+                    (torch.zeros((self.batch_size, self.curr_frame), dtype=torch.long, device=t_next.device), t_next), dim=1
                 )
 
                 self.xs[:, start_frame:] = self.diffusion.ddim_sample_step(
