@@ -92,8 +92,21 @@ def apply_rope_nd(
     cos = cos.reshape(*shape, -1)
     sin = sin.reshape(*shape, -1)
 
-    q_rot = rope_mix(q, cos, sin)
     k_rot = rope_mix(k, cos, sin)
+
+    # temporal attention with caching
+    if len(shape) == 1:
+        q_offset = k.shape[2] - q.shape[2]
+
+        if q_offset > 0:
+            cos_q = cos[q_offset:, :]
+            sin_q = sin[q_offset:, :]
+            q_rot = rope_mix(q, cos_q, sin_q)
+        else:
+            q_rot = rope_mix(q, cos, sin)
+    else:
+        q_rot = rope_mix(q, cos, sin)
+
     return q_rot, k_rot
 
 
@@ -132,9 +145,112 @@ class Attention(nn.Module):
         self.rotary_type = rotary_type
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
         self.out_proj = nn.Linear(dim, dim)
+        self.k_cache_cond: torch.Tensor | None = None
+        self.v_cache_cond: torch.Tensor | None = None
+        self.k_cache_null: torch.Tensor | None = None
+        self.v_cache_null: torch.Tensor | None = None
+        self.cache_start: int | None = None
+        self.cache_end: int | None = None
 
-    def forward(self, x: torch.Tensor):
+    def clear_cache(self):
+        """Clear the KV cache."""
+        self.k_cache_cond = None
+        self.v_cache_cond = None
+        self.k_cache_null = None
+        self.v_cache_null = None
+        self.cache_start = None
+        self.cache_end = None
+
+    def _forward_with_cache(self, x: torch.Tensor, start_frame: int, cache_idx: int, cache_type: str = 'cond') -> torch.Tensor:
+        """Forward pass with KV caching for temporal attention."""
         B, T, H, W, D = x.shape
+
+        x = einops.rearrange(x, "b t h w d -> (b h w) t d")
+
+        k_cache = self.k_cache_cond if cache_type == 'cond' else self.k_cache_null
+        v_cache = self.v_cache_cond if cache_type == 'cond' else self.v_cache_null
+
+        num_clean_in_window = max(0, cache_idx - start_frame)
+
+        x_old = x[:, :num_clean_in_window, :]
+
+        if num_clean_in_window > 0:
+            x_new = x[:, num_clean_in_window:, ...]
+        else:
+            x_new = x
+
+        qkv_new = self.qkv_proj(x_new)
+        q_new, k_new, v_new = qkv_new.chunk(3, dim=-1)
+        q = einops.rearrange(q_new, "B T (head d) -> B head T d", head=self.num_heads)
+        k_new = einops.rearrange(k_new, "B T (head d) -> B head T d", head=self.num_heads)
+        v_new = einops.rearrange(v_new, "B T (head d) -> B head T d", head=self.num_heads)
+
+        if num_clean_in_window > 0:
+            if k_cache is not None:
+                rel_start = start_frame - self.cache_start
+                rel_end = cache_idx - self.cache_start
+
+                if rel_start < 0 or rel_end > k_cache.shape[2]:
+                    raise ValueError(
+                        f"Cache bounds error: trying to access cache[{rel_start}:{rel_end}] "
+                        f"but cache has length {k_cache.shape[2]} "
+                        f"(cache_start={self.cache_start}, cache_end={self.cache_end}, "
+                        f"start_frame={start_frame}, cache_idx={cache_idx})"
+                    )
+
+                k_cached = k_cache[:, :, rel_start:rel_end, :]
+                v_cached = v_cache[:, :, rel_start:rel_end, :]
+            else:
+                qkv_old = self.qkv_proj(x_old)
+                _, k_old, v_old = qkv_old.chunk(3, dim=-1)
+                k_cached = einops.rearrange(k_old, "B T (head d) -> B head T d", head=self.num_heads)
+                v_cached = einops.rearrange(v_old, "B T (head d) -> B head T d", head=self.num_heads)
+
+            k = torch.cat([k_cached, k_new], dim=2)
+            v = torch.cat([v_cached, v_new], dim=2)
+        else:
+            k = k_new
+            v = v_new
+
+        if cache_type == 'cond':
+            self.k_cache_cond = k.detach()
+            self.v_cache_cond = v.detach()
+        else:
+            self.k_cache_null = k.detach()
+            self.v_cache_null = v.detach()
+
+        self.cache_start = start_frame
+        self.cache_end = start_frame + k.shape[2]
+
+        sequence_shape = (T,)
+        q, k = apply_rope_nd(q, k, sequence_shape, rotary_type=self.rotary_type)
+
+        q = einops.rearrange(q, "B head T d -> B head T d")
+        k = einops.rearrange(k, "B head T d -> B head T d")
+        v = einops.rearrange(v, "B head T d -> B head T d")
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
+        out = einops.rearrange(out, "B head seq d -> B seq (head d)")
+        out = self.out_proj(out)
+
+        if num_clean_in_window > 0:
+            out = torch.cat([x_old, out], dim=1) # prepend anything doesn't matter
+
+        out = einops.rearrange(out, "(b h w) t d -> b t h w d", h=H, w=W)
+        return out
+
+    def forward(self, x: torch.Tensor, cache_idx: int | None = None, start_frame: int | None = None, cache_type: str = 'cond'):
+        B, T, H, W, D = x.shape
+
+        use_cache = (
+            cache_idx is not None
+            and start_frame is not None
+            and cache_idx > start_frame
+            and self.attention_type == AttentionType.TEMPORAL
+        )
+
+        if use_cache:
+            return self._forward_with_cache(x, start_frame, cache_idx, cache_type)
 
         if self.attention_type == AttentionType.SPATIAL:
             x = einops.rearrange(x, "b t h w d -> (b t) h w d")
@@ -194,11 +310,11 @@ class DiTBlock(nn.Module):
             nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor, cache_idx: int | None = None, start_frame: int | None = None, cache_type: str = 'cond') -> torch.Tensor:
         _, _, H, W, _ = x.shape
         m = self.adaLN_modulation(c)
         m = einops.repeat(m, "b t d -> b t h w d", h=H, w=W).chunk(6, dim=-1)
-        x = x + self.attn(self.norm1(x) * (1 + m[1]) + m[0]) * m[2]
+        x = x + self.attn(self.norm1(x) * (1 + m[1]) + m[0], cache_idx, start_frame, cache_type) * m[2]
         x = x + self.ffwd(self.norm2(x) * (1 + m[4]) + m[3]) * m[5]
         return x
 
@@ -230,9 +346,9 @@ class Block(nn.Module):
             else RotaryType.STANDARD,
         )
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor, cache_idx: int | None = None, start_frame: int | None = None, cache_type: str = 'cond') -> torch.Tensor:
         x = self.s_block(x, c)
-        x = self.t_block(x, c)
+        x = self.t_block(x, c, cache_idx, start_frame, cache_type)
         return x
 
 
@@ -356,14 +472,20 @@ class DiT(nn.Module):
         c += self.action_embedder(action)
         return c
 
+    def clear_kv_cache(self):
+        """Clear KV cache in all temporal attention layers."""
+        for block in self.blocks:
+            block.t_block.attn.clear_cache()
+
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, action: torch.Tensor
+        self, x: torch.Tensor, t: torch.Tensor, action: torch.Tensor,
+        cache_idx: int | None = None, start_frame: int | None = None, cache_type: str = 'cond'
     ) -> torch.Tensor:
         B, T, H, W, C = x.shape
         x = self.patchify(x)
         c = self.get_cond(t, action)
         for block in self.blocks:
-            x = block(x, c)
+            x = block(x, c, cache_idx, start_frame, cache_type)
         x = self.final_layer(x, c)
         x = einops.rearrange(x, "b t h w d -> (b t) h w d")
         x = self.unpatchify(x)

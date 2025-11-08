@@ -66,6 +66,8 @@ class Diffusion(nn.Module):
         t_idx: torch.Tensor,
         t_next_idx: torch.Tensor,
         cfg: float = 1.0,
+        cache_idx: int | None = None,
+        start_frame: int | None = None,
     ) -> torch.Tensor:
         # Derived from
         # https://github.com/buoyancy99/diffusion-forcing/blob/475e0bcab87545e48b24b39fb46a81fe59d80594/algorithms/diffusion_forcing/models/diffusion.py#L383
@@ -96,9 +98,9 @@ class Diffusion(nn.Module):
         ).view(B, T, 1, 1, 1)
         c = (1 - alphas_next_cumprod).sqrt()
 
-        v_pred_cond = model(x, clipped_t, actions)
+        v_pred_cond = model(x, clipped_t, actions, cache_idx, start_frame, cache_type='cond')
         if cfg != 1.0:
-            v_pred_null = model(x, clipped_t, model.get_null_cond(actions))
+            v_pred_null = model(x, clipped_t, model.get_null_cond(actions), cache_idx, start_frame, cache_type='null')
             v_pred = (1 - cfg) * v_pred_null + cfg * v_pred_cond
         else:
             v_pred = v_pred_cond
@@ -245,8 +247,8 @@ class FlowMatching(nn.Module):
                 dt = t_curr - t_next
                 # predict the velocity
                 t_curr = torch.cat([t, einops.repeat(t_curr, " -> b 1", b=B)], dim=1)
-                v_cond = model(x_pred[:, start_frame:], t_curr[:, start_frame:] * self.timesteps, actions[:, start_frame:curr_frame+1])
-                v_null = model(x_pred[:, start_frame:], t_curr[:, start_frame:] * self.timesteps, model.get_null_cond(actions)[:, start_frame:curr_frame+1])
+                v_cond = model(x_pred[:, start_frame:], t_curr[:, start_frame:] * self.timesteps, actions[:, start_frame:curr_frame+1], cache_type='cond')
+                v_null = model(x_pred[:, start_frame:], t_curr[:, start_frame:] * self.timesteps, model.get_null_cond(actions)[:, start_frame:curr_frame+1], cache_type='null')
                 v_pred = (1 - cfg) * v_null + cfg * v_cond
                 # take a step in the backwards velocity direction
                 x_pred[:, -1:] -= dt * v_pred[:, -1:]

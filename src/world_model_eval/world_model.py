@@ -1,6 +1,4 @@
-from tqdm import tqdm
 import torch
-import numpy as np
 import einops
 from .model import DiT, AttentionType, RotaryType
 from .vae import VAE
@@ -8,7 +6,7 @@ from .diffusion import Diffusion
 
 
 class WorldModel:
-    def __init__(self, checkpoint_path: str, use_pixel_rope: bool = False, default_cfg: float = 1.0):
+    def __init__(self, checkpoint_path: str, use_pixel_rope: bool = False, default_cfg: float = 1.0, use_kv_cache: bool = True):
         self.device = "cuda:0"
         self.model = (
             DiT(
@@ -40,6 +38,7 @@ class WorldModel:
         self.actions = None
         self.curr_frame = 0
         self.cfg = default_cfg  # Feel free to override this after __init__
+        self.use_kv_cache = use_kv_cache
 
     def reset(self, x):
         x = einops.repeat(x, "b h w c -> b t h w c", t=1)
@@ -47,6 +46,9 @@ class WorldModel:
         self.xs = self.vae.encode(x)
         self.actions = torch.zeros((self.batch_size, 1, self.model.action_dim), device=self.device)
         self.curr_frame = 1
+        # Clear KV cache on reset
+        if self.use_kv_cache:
+            self.model.clear_kv_cache()
 
     @torch.no_grad()
     def generate_chunk(self, action_vec):
@@ -85,14 +87,32 @@ class WorldModel:
                     (torch.zeros((self.batch_size, self.curr_frame), dtype=torch.long, device=t_next.device), t_next), dim=1
                 )
 
-                self.xs[:, start_frame:] = self.diffusion.ddim_sample_step(
+                if self.use_kv_cache:
+                    clean_mask = (t == 0)
+                    if clean_mask.any():
+                        cache_idx = clean_mask.nonzero()[-1][1] + 1 + start_frame
+                    else:
+                        cache_idx = start_frame
+                else:
+                    cache_idx = None
+
+                result = self.diffusion.ddim_sample_step(
                     self.model,
                     self.xs[:, start_frame:],
                     self.actions[:, start_frame : self.curr_frame + self.chunk_size],
                     t[:, start_frame:],
                     t_next[:, start_frame:],
                     cfg=self.cfg,
+                    cache_idx=cache_idx,
+                    start_frame=start_frame,
                 )
+
+                # Only update new frames, not cached frames
+                if self.use_kv_cache and cache_idx is not None and cache_idx > start_frame:
+                    num_clean_in_window = cache_idx - start_frame
+                    self.xs[:, cache_idx:] = result[:, num_clean_in_window:]
+                else:
+                    self.xs[:, start_frame:] = result
 
                 latest_clean_idx = (t_next == 0).nonzero()[-1][1]
                 if latest_clean_idx >= self.curr_frame:
