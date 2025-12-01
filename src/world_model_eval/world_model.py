@@ -53,6 +53,8 @@ class WorldModel:
     @torch.no_grad()
     def generate_chunk(self, action_vec):
         """See Diffusion.generate"""
+        if self.use_kv_cache:
+            self.model.clear_kv_cache()
         if action_vec.dim() == 2:
             # Batch of actions (batch_size, action_dim) -> (batch_size, 1, action_dim)
             action_vec = action_vec.unsqueeze(1)
@@ -88,9 +90,10 @@ class WorldModel:
                 )
 
                 if self.use_kv_cache:
-                    clean_mask = (t == 0)
-                    if clean_mask.any():
-                        cache_idx = clean_mask.nonzero()[-1][1] + 1 + start_frame
+                    window_clean_mask = (t[:, start_frame:] == 0)
+                    if window_clean_mask.any():
+                        last_clean_rel_idx = window_clean_mask.nonzero()[-1][1].item()
+                        cache_idx = start_frame + last_clean_rel_idx + 1
                     else:
                         cache_idx = start_frame
                 else:
@@ -107,11 +110,13 @@ class WorldModel:
                     start_frame=start_frame,
                 )
 
-                # Only update new frames, not cached frames
-                if self.use_kv_cache and cache_idx is not None and cache_idx > start_frame:
-                    num_clean_in_window = cache_idx - start_frame
-                    self.xs[:, cache_idx:] = result[:, num_clean_in_window:]
+                # Check if model actually sliced by comparing result shape
+                expected_full_length = self.curr_frame + self.chunk_size - start_frame
+                if result.shape[1] < expected_full_length:
+                    # Model sliced: result only contains frames from cache_idx onwards
+                    self.xs[:, cache_idx:] = result
                 else:
+                    # Model didn't slice: result contains all frames from start_frame
                     self.xs[:, start_frame:] = result
 
                 latest_clean_idx = (t_next == 0).nonzero()[-1][1]

@@ -105,14 +105,39 @@ class Diffusion(nn.Module):
         else:
             v_pred = v_pred_cond
 
-        x_start = alphas_cumprod.sqrt() * x - (1 - alphas_cumprod).sqrt() * v_pred
-        pred_noise = ((1 / alphas_cumprod).sqrt() * x - x_start) / ((1 / alphas_cumprod) - 1).sqrt()
-        x_pred = alphas_next_cumprod.sqrt() * x_start + c * pred_noise
-        x_pred = torch.where(
-            (t == t_next).view(B, T, 1, 1, 1),
-            orig_x,
-            x_pred,
-        )
+        # When using KV cache, model only returns new frames if cache exists
+        # Check if model actually sliced by comparing output shape
+        model_sliced = v_pred.shape[1] < T
+
+        if model_sliced:
+            # Model sliced input and returned only new frames
+            # Slice other tensors to match
+            start_rel = cache_idx - start_frame
+            x_sliced = x[:, start_rel:, ...]
+            alphas_cumprod_sliced = alphas_cumprod[:, start_rel:, ...]
+            alphas_next_cumprod_sliced = alphas_next_cumprod[:, start_rel:, ...]
+            c_sliced = c[:, start_rel:, ...]
+            t_sliced = t[:, start_rel:, ...]
+            t_next_sliced = t_next[:, start_rel:, ...]
+            orig_x_sliced = orig_x[:, start_rel:, ...]
+
+            x_start = alphas_cumprod_sliced.sqrt() * x_sliced - (1 - alphas_cumprod_sliced).sqrt() * v_pred
+            pred_noise = ((1 / alphas_cumprod_sliced).sqrt() * x_sliced - x_start) / ((1 / alphas_cumprod_sliced) - 1).sqrt()
+            x_pred = alphas_next_cumprod_sliced.sqrt() * x_start + c_sliced * pred_noise
+            x_pred = torch.where(
+                (t_sliced == t_next_sliced).view(B, -1, 1, 1, 1),
+                orig_x_sliced,
+                x_pred,
+            )
+        else:
+            x_start = alphas_cumprod.sqrt() * x - (1 - alphas_cumprod).sqrt() * v_pred
+            pred_noise = ((1 / alphas_cumprod).sqrt() * x - x_start) / ((1 / alphas_cumprod) - 1).sqrt()
+            x_pred = alphas_next_cumprod.sqrt() * x_start + c * pred_noise
+            x_pred = torch.where(
+                (t == t_next).view(B, T, 1, 1, 1),
+                orig_x,
+                x_pred,
+            )
         return x_pred
 
     def generate_pyramid_scheduling_matrix(self, horizon: int) -> torch.Tensor:

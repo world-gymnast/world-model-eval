@@ -170,42 +170,28 @@ class Attention(nn.Module):
         k_cache = self.k_cache_cond if cache_type == 'cond' else self.k_cache_null
         v_cache = self.v_cache_cond if cache_type == 'cond' else self.v_cache_null
 
-        num_clean_in_window = max(0, cache_idx - start_frame)
-
-        x_old = x[:, :num_clean_in_window, :]
-
-        if num_clean_in_window > 0:
-            x_new = x[:, num_clean_in_window:, ...]
-        else:
-            x_new = x
-
-        qkv_new = self.qkv_proj(x_new)
+        # x contains only the new frames
+        qkv_new = self.qkv_proj(x)
         q_new, k_new, v_new = qkv_new.chunk(3, dim=-1)
         q = einops.rearrange(q_new, "B T (head d) -> B head T d", head=self.num_heads)
         k_new = einops.rearrange(k_new, "B T (head d) -> B head T d", head=self.num_heads)
         v_new = einops.rearrange(v_new, "B T (head d) -> B head T d", head=self.num_heads)
 
-        if num_clean_in_window > 0:
-            if k_cache is not None:
-                rel_start = start_frame - self.cache_start
-                rel_end = cache_idx - self.cache_start
+        if k_cache is not None:
+            rel_start = start_frame - self.cache_start
+            rel_end = cache_idx - self.cache_start
 
-                if rel_start < 0 or rel_end > k_cache.shape[2]:
-                    raise ValueError(
-                        f"Cache bounds error: trying to access cache[{rel_start}:{rel_end}] "
-                        f"but cache has length {k_cache.shape[2]} "
-                        f"(cache_start={self.cache_start}, cache_end={self.cache_end}, "
-                        f"start_frame={start_frame}, cache_idx={cache_idx})"
-                    )
+            if rel_start < 0 or rel_end > k_cache.shape[2]:
+                raise ValueError(
+                    f"Cache bounds error: trying to access cache[{rel_start}:{rel_end}] "
+                    f"but cache has length {k_cache.shape[2]} "
+                    f"(cache_start={self.cache_start}, cache_end={self.cache_end}, "
+                    f"start_frame={start_frame}, cache_idx={cache_idx})"
+                )
 
-                k_cached = k_cache[:, :, rel_start:rel_end, :]
-                v_cached = v_cache[:, :, rel_start:rel_end, :]
-            else:
-                qkv_old = self.qkv_proj(x_old)
-                _, k_old, v_old = qkv_old.chunk(3, dim=-1)
-                k_cached = einops.rearrange(k_old, "B T (head d) -> B head T d", head=self.num_heads)
-                v_cached = einops.rearrange(v_old, "B T (head d) -> B head T d", head=self.num_heads)
-
+            k_cached = k_cache[:, :, rel_start:rel_end, :]
+            v_cached = v_cache[:, :, rel_start:rel_end, :]
+            
             k = torch.cat([k_cached, k_new], dim=2)
             v = torch.cat([v_cached, v_new], dim=2)
         else:
@@ -222,19 +208,15 @@ class Attention(nn.Module):
         self.cache_start = start_frame
         self.cache_end = start_frame + k.shape[2]
 
-        sequence_shape = (T,)
+        sequence_shape = (k.shape[2],)
         q, k = apply_rope_nd(q, k, sequence_shape, rotary_type=self.rotary_type)
-
         q = einops.rearrange(q, "B head T d -> B head T d")
         k = einops.rearrange(k, "B head T d -> B head T d")
         v = einops.rearrange(v, "B head T d -> B head T d")
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         out = einops.rearrange(out, "B head seq d -> B seq (head d)")
         out = self.out_proj(out)
-
-        if num_clean_in_window > 0:
-            out = torch.cat([x_old, out], dim=1) # prepend anything doesn't matter
 
         out = einops.rearrange(out, "(b h w) t d -> b t h w d", h=H, w=W)
         return out
@@ -484,6 +466,21 @@ class DiT(nn.Module):
         B, T, H, W, C = x.shape
         x = self.patchify(x)
         c = self.get_cond(t, action)
+
+        # Only slice input if cache actually exists
+        has_cache = any(
+            block.t_block.attn.k_cache_cond is not None if cache_type == 'cond'
+            else block.t_block.attn.k_cache_null is not None
+            for block in self.blocks
+        )
+
+        if cache_idx is not None and start_frame is not None and cache_idx > start_frame and has_cache:
+             start_rel = cache_idx - start_frame
+             x = x[:, start_rel:, ...]
+             c = c[:, start_rel:, ...]
+             # Update T for subsequent reshapes
+             T = x.shape[1]
+
         for block in self.blocks:
             x = block(x, c, cache_idx, start_frame, cache_type)
         x = self.final_layer(x, c)
