@@ -6,8 +6,8 @@ from .diffusion import Diffusion
 
 
 class WorldModel:
-    def __init__(self, checkpoint_path: str, use_pixel_rope: bool = False, default_cfg: float = 1.0, use_kv_cache: bool = True):
-        self.device = "cuda:0"
+    def __init__(self, checkpoint_path: str, use_pixel_rope: bool = False, default_cfg: float = 1.0, use_kv_cache: bool = True, rank: int = 0):
+        self.device = "cuda:{}".format(rank)
         self.model = (
             DiT(
                 in_channels=16,

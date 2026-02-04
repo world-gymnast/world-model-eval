@@ -37,7 +37,7 @@ def rescale_bridge_action(
     a[6] = torch.where(a[6] > 0.8, -1.0, +1.0)
     return a
 
-def encode_video(video, stride=20):
+def encode_video(video, stride=3):
     frames, idx = [], 0
     for idx, frame in enumerate(video):
         if idx % stride == 0:
